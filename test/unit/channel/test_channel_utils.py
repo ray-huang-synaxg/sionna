@@ -261,6 +261,37 @@ class TestCirToOfdmChannel:
         avg_power = h_f.abs().square().mean(dim=(2, 4, 5, 6))
         assert torch.allclose(avg_power, torch.ones_like(avg_power), atol=0.1)
 
+    @pytest.mark.parametrize("tau_rank", [4, 6])
+    def test_matches_dft_definition(self, tau_rank, precision, device):
+        """Verify cir_to_ofdm_channel matches explicit sum_m a_m exp(-j 2 pi f tau_m)."""
+        batch_size, num_rx, num_rx_ant = 2, 3, 2
+        num_tx, num_tx_ant, num_paths, num_time_steps, fft_size = 2, 4, 5, 3, 16
+
+        cdtype = dtypes[precision]["torch"]["cdtype"]
+        dtype = dtypes[precision]["torch"]["dtype"]
+        a = torch.randn(
+            batch_size, num_rx, num_rx_ant, num_tx, num_tx_ant, num_paths, num_time_steps,
+            dtype=cdtype, device=device,
+        )
+        if tau_rank == 4:
+            tau = torch.rand(batch_size, num_rx, num_tx, num_paths, dtype=dtype, device=device) * 1e-6
+            tau_ref = tau[:, :, None, :, None, :, None, None]
+        else:
+            tau = torch.rand(
+                batch_size, num_rx, num_rx_ant, num_tx, num_tx_ant, num_paths,
+                dtype=dtype, device=device,
+            ) * 1e-6
+            tau_ref = tau[:, :, :, :, :, :, None, None]
+
+        frequencies = subcarrier_frequencies(fft_size, 30e3, precision=precision, device=device)
+        h_f = cir_to_ofdm_channel(frequencies, a, tau)
+
+        ref = (a.unsqueeze(-1) * torch.exp(torch.complex(
+            torch.zeros_like(tau_ref), -2 * PI * frequencies * tau_ref
+        ))).sum(dim=-3)
+        atol = 1e-5 if precision == "single" else 1e-12
+        assert torch.allclose(h_f, ref, atol=atol)
+
 
 class TestCirToTimeChannel:
     """Tests for cir_to_time_channel function"""

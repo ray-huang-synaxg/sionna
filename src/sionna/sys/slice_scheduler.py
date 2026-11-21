@@ -260,6 +260,32 @@ class SliceAwarePFScheduler(PFSchedulerSUMIMO):
         # Round-robin counter per slice (index of the next UE to serve)
         self._rr_counters: Dict[int, int] = {qfi: 0 for qfi in slice_prb_config}
 
+        # _use_pf_metric: [num_freq_res]
+        #   True  -> use PF metric (rate / T_past)
+        #   False -> use raw rate (priority policy)
+        # Round-robin is handled as a special case when _has_round_robin is True.
+        use_pf = torch.ones(num_freq_res, dtype=torch.bool, device=self.device)
+        has_rr = False
+        for qfi, (start, end) in self._slice_ranges.items():
+            policy = self._slice_policies[qfi]
+            if policy == "priority":
+                use_pf[start:end] = False
+            elif policy == "round_robin":
+                has_rr = True
+        self.register_buffer("_use_pf_metric", use_pf, persistent=False)
+        self._has_round_robin = has_rr
+
+        # _neg_inf_mask: [num_freq_res, num_ut] — -inf where UE is not
+        # allowed on a frequency resource, 0 where allowed.
+        # Adding this to a metric tensor effectively masks out-of-slice UEs
+        # so argmax picks only in-slice UEs — fully vectorized, no loops.
+        neg_inf_mask = torch.where(
+            self._prb_mask.to(self.device),
+            torch.zeros(1, dtype=self.dtype, device=self.device),
+            torch.tensor(float("-inf"), dtype=self.dtype, device=self.device),
+        )  # [num_freq_res, num_ut]
+        self.register_buffer("_neg_inf_mask", neg_inf_mask, persistent=False)
+
     @property
     def slice_ranges(self) -> Dict[int, Tuple[int, int]]:
         """dict[int, tuple[int, int]] (read-only): PRB range per QFI."""
@@ -306,19 +332,9 @@ class SliceAwarePFScheduler(PFSchedulerSUMIMO):
         rate_achieved_past = insert_dims(rate_achieved_past_new, 2, axis=-2)
 
         # --- apply PRB mask: zero achievable rate for out-of-slice PRBs ---
-        # _prb_mask: [num_freq_res, num_ut] → broadcast to full grid shape
-        prb_mask = self._prb_mask.to(rate_achievable_curr_slot.device)
-
-        # Determine leading batch dims by counting extra dims beyond [sym, freq, ut]
-        ndim = rate_achievable_curr_slot.dim()
-        # shape: [num_freq_res, num_ut] needs ndim-3 leading dims and 0 trailing
-        for _ in range(ndim - 3):
-            prb_mask = prb_mask.unsqueeze(0)
-        # prb_mask: [1, ..., num_freq_res, num_ut] broadcastable to full shape
-        # Insert OFDM-symbol dim (second-to-last of the original 4-D block)
-        prb_mask = prb_mask.unsqueeze(-3)  # [..., 1, num_freq_res, num_ut]
-
-        rate_masked = rate_achievable_curr_slot * prb_mask
+        dev = rate_achievable_curr_slot.device
+        prb_mask = self._prb_mask.to(dev)
+        rate_masked = rate_achievable_curr_slot * prb_mask.unsqueeze(-3)
 
         # --- PF metric for the full grid ---
         # [batch_size, num_ofdm_sym, num_freq_res, num_ut]
@@ -327,64 +343,43 @@ class SliceAwarePFScheduler(PFSchedulerSUMIMO):
         # Store for external inspection
         self._pf_metric.copy_(pf_metric)
 
-        # --- schedule within each slice ---
-        # Accumulate scheduling decisions: start with zeros (no one scheduled)
-        is_scheduled_int = torch.zeros(
-            *rate_achievable_curr_slot.shape,
-            dtype=torch.long,
-            device=rate_achievable_curr_slot.device,
-        )
+        # --- vectorized scheduling across PF and priority slices ---
+        # Select PF metric or raw achievable rate per frequency resource
+        # _use_pf_metric: [num_freq_res] -> [1, num_freq_res, 1]
+        use_pf = self._use_pf_metric.to(dev).unsqueeze(0).unsqueeze(-1)
+        metric = torch.where(use_pf, pf_metric, rate_achievable_curr_slot)
 
-        for qfi, (start, end) in self._slice_ranges.items():
-            ut_mask = self._slice_ut_masks[qfi].to(rate_achievable_curr_slot.device)
-            policy = self._slice_policies[qfi]
+        # Mask out-of-slice UEs to -inf so argmax only considers in-slice UEs
+        neg_inf_mask = self._neg_inf_mask.to(device=dev, dtype=metric.dtype)
+        masked_metric = metric + neg_inf_mask.unsqueeze(-3)
 
-            # Indices of UEs belonging to this slice
-            ut_indices = ut_mask.nonzero(as_tuple=True)[0]  # [num_ut_in_slice]
-            num_ut_in_slice = len(ut_indices)
-            if num_ut_in_slice == 0:
-                continue
+        # [batch..., num_ofdm_sym, num_freq_res]
+        winner = torch.argmax(masked_metric, dim=-1)
 
-            if policy == "proportional_fair":
-                # Standard PF: argmax of R̃/T_past restricted to slice PRBs and UEs
-                # [batch..., num_ofdm_sym, slice_prbs, num_ut_in_slice]
-                slice_metric = pf_metric[..., start:end, :][..., ut_mask]
-                # [batch..., num_ofdm_sym, slice_prbs]
-                local_winner = torch.argmax(slice_metric, dim=-1)
-                # Map local index back to global UE index
-                global_winner = ut_indices[local_winner]
-
-            elif policy == "priority":
-                # Greedy: schedule UE with highest absolute achievable rate
-                slice_rate = rate_achievable_curr_slot[..., start:end, :][..., ut_mask]
-                local_winner = torch.argmax(slice_rate, dim=-1)
-                global_winner = ut_indices[local_winner]
-
-            elif policy == "round_robin":
-                # Cycle through UEs in fixed order, ignoring channel quality
+        # Handle round-robin slices (if any)
+        if self._has_round_robin:
+            winner = winner.clone()
+            for qfi, (start, end) in self._slice_ranges.items():
+                if self._slice_policies[qfi] != "round_robin":
+                    continue
+                ut_mask = self._slice_ut_masks[qfi].to(dev)
+                ut_indices = ut_mask.nonzero(as_tuple=True)[0]
+                num_ut_in_slice = len(ut_indices)
+                if num_ut_in_slice == 0:
+                    continue
                 rr_idx = self._rr_counters[qfi] % num_ut_in_slice
-                # Same UE assigned to every PRB/symbol in this slot
-                global_winner = ut_indices[rr_idx].expand(
-                    *rate_achievable_curr_slot.shape[:-1][:-1],  # batch + sym
-                    end - start,  # num prbs in slice
-                )
+                winner[..., start:end] = ut_indices[rr_idx]
                 self._rr_counters[qfi] = (rr_idx + 1) % num_ut_in_slice
 
-            else:
-                raise ValueError(f"Unknown policy '{policy}' for QFI {qfi}.")
-
-            # Write scheduling decisions for this slice's PRBs
-            # global_winner: [..., num_ofdm_sym, slice_prbs] with values in [0, num_ut)
-            slice_scheduled = torch.nn.functional.one_hot(
-                global_winner, num_classes=self._num_ut
-            )  # [..., num_ofdm_sym, slice_prbs, num_ut]
-            is_scheduled_int[..., start:end, :] = slice_scheduled
+        # Convert winner indices to boolean mask:
+        # [batch..., num_ofdm_sym, num_freq_res, num_ut]
+        is_scheduled = torch.nn.functional.one_hot(
+            winner, num_classes=self._num_ut
+        ).to(torch.bool)
 
         # Expand to include streams dimension
-        # [batch..., num_ofdm_sym, num_freq_res, num_ut, 1]
-        is_scheduled = is_scheduled_int.unsqueeze(-1)
         # [batch..., num_ofdm_sym, num_freq_res, num_ut, num_streams]
-        is_scheduled = is_scheduled.expand(
-            *is_scheduled.shape[:-1], self._num_streams_per_ut
+        is_scheduled = is_scheduled.unsqueeze(-1).expand(
+            *is_scheduled.shape, self._num_streams_per_ut
         )
-        return is_scheduled.to(torch.bool)
+        return is_scheduled

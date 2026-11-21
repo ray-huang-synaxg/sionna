@@ -431,3 +431,43 @@ class TestSliceAwarePFSchedulerEdgeCases:
         assert result.shape == (14, num_freq_res, num_ut, 1)
         # Exactly one UE per resource
         assert (result.sum(dim=-2).squeeze(-1) == 1).all()
+
+    def test_three_slices_with_batch_and_policies(self, device, precision):
+        """Batched call with PF, round-robin, and priority slices together."""
+        batch_size = [2, 3]
+        num_ut = 6
+        num_freq_res = 12
+        num_ofdm_sym = 2
+        qfi_per_ut = torch.tensor([1, 1, 2, 2, 9, 9], dtype=torch.int32, device=device)
+        slice_prb_config = {
+            1: {"num_prbs": 4, "policy": "proportional_fair"},
+            2: {"num_prbs": 4, "policy": "round_robin"},
+            9: {"num_prbs": 4, "policy": "priority"},
+        }
+        scheduler = SliceAwarePFScheduler(
+            qfi_per_ut=qfi_per_ut,
+            slice_prb_config=slice_prb_config,
+            num_ut=num_ut,
+            num_freq_res=num_freq_res,
+            num_ofdm_sym=num_ofdm_sym,
+            batch_size=batch_size,
+            precision=precision,
+            device=device,
+        )
+        rate_last = torch.ones(*batch_size, num_ut, device=device)
+        rate_ach = torch.ones(*batch_size, num_ofdm_sym, num_freq_res, num_ut, device=device)
+        # Make UE 5 win priority slice (PRBs 8..11)
+        rate_ach[..., 5] = 50.0
+        # Make UE 0 win PF slice (PRBs 0..3)
+        rate_ach[..., 0] = 20.0
+
+        res1 = scheduler(rate_last, rate_ach).squeeze(-1)
+        assert res1.shape == (*batch_size, num_ofdm_sym, num_freq_res, num_ut)
+        assert (res1.sum(dim=-1) == 1).all()
+        assert res1[..., 0:4, 0].all()
+        assert res1[..., 4:8, 2].all()
+        assert res1[..., 8:12, 5].all()
+
+        # Next slot advances round-robin slice (PRBs 4..7) to UE 3
+        res2 = scheduler(rate_last, rate_ach).squeeze(-1)
+        assert res2[..., 4:8, 3].all()

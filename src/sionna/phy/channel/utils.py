@@ -266,37 +266,22 @@ def cir_to_ofdm_channel(
         print(h_f.shape)
         # torch.Size([2, 1, 1, 1, 1, 10, 64])
     """
-    real_dtype = tau.dtype
-
-    if tau.dim() == 4:
-        # Expand dims to broadcast with h. Add the following dimensions:
-        #  - number of rx antennas (2)
-        #  - number of tx antennas (4)
-        tau = tau.unsqueeze(2).unsqueeze(4)
-        # Manually tile for high-rank tensor broadcasting
-        tau = tau.expand(-1, -1, -1, -1, a.shape[4], -1)
-
-    # Add a time samples dimension for broadcasting
-    tau = tau.unsqueeze(6)
-
-    # Bring all tensors to broadcastable shapes
-    tau = tau.unsqueeze(-1)
-    h = a.unsqueeze(-1)
     # Ensure frequencies is on the same device as tau
     frequencies = frequencies.to(device=tau.device, dtype=tau.dtype)
-    frequencies = expand_to_rank(frequencies, tau.dim(), axis=0)
 
-    # Compute the Fourier transforms of all cluster taps
-    # Exponential component
-    e = torch.exp(
-        torch.complex(
-            torch.zeros_like(tau),
-            -2 * PI * frequencies * tau,
-        )
-    )
-    h_f = h * e
-    # Sum over all clusters to get the channel frequency responses
-    h_f = h_f.sum(dim=-3)
+    if tau.dim() == 4:
+        # tau: [batch_size, num_rx, num_tx, num_paths]
+        # Avoid materializing the full [..., num_rx_ant, ..., num_tx_ant, num_paths, fft_size]
+        # intermediate tensor by computing the phase factor without antenna dims and
+        # contracting over paths with einsum.
+        phase = (-2 * PI) * tau.unsqueeze(-1) * frequencies
+        e = torch.complex(torch.cos(phase), torch.sin(phase))
+        h_f = torch.einsum("brutvps,brtpf->brutvsf", a, e)
+    else:
+        # tau: [batch_size, num_rx, num_rx_ant, num_tx, num_tx_ant, num_paths]
+        phase = (-2 * PI) * tau.unsqueeze(-1) * frequencies
+        e = torch.complex(torch.cos(phase), torch.sin(phase))
+        h_f = torch.einsum("brutvps,brutvpf->brutvsf", a, e)
 
     if normalize:
         # Normalization is performed such that for each batch example and

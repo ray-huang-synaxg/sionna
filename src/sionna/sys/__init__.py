@@ -15,6 +15,12 @@ from sionna.sys.power_control import (
     open_loop_uplink_power_control,
 )
 from sionna.sys.scheduling import PFSchedulerSUMIMO
+from sionna.sys.slice_scheduler import (
+    SliceAwarePFScheduler,
+    build_slice_prb_mask,
+    validate_slice_config,
+    get_slice_prb_ranges,
+)
 from sionna.sys.topology import (
     HexGrid,
     Hexagon,
@@ -42,6 +48,11 @@ __all__ = [
     "downlink_fair_power_control",
     # scheduling
     "PFSchedulerSUMIMO",
+    # slice_scheduler
+    "SliceAwarePFScheduler",
+    "build_slice_prb_mask",
+    "validate_slice_config",
+    "get_slice_prb_ranges",
     # topology
     "get_num_hex_in_grid",
     "convert_hex_coord",
